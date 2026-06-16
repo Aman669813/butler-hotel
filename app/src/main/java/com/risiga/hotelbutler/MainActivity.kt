@@ -1,6 +1,7 @@
 package com.risiga.hotelbutler
 
 import android.Manifest
+import org.json.JSONObject
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -216,6 +217,7 @@ private fun VoiceConcierge(
     var vphase by remember(stay.stayId) { mutableStateOf(VoicePhase.GREETING) }
     var status by remember(stay.stayId) { mutableStateOf("") }
     val turns = remember(stay.stayId) { mutableStateListOf<Pair<String, String>>() }
+    val menuCache = remember(stay.stayId) { mutableListOf<MenuItem>() }
 
     LaunchedEffect(stay.stayId) {
         // 1) Greet on check-in, then fall silent
@@ -310,6 +312,23 @@ private fun VoiceConcierge(
                 val stop = isStopPhrase(said)
                 val askingSpa = items.contains("Spa appointment") && !spaAsked        // first spa mention → ask for type/time
                 val consumingSpaPref = spaAsked && !askingSpa && !stop                 // the next utterance carries the preference
+
+                // Room service → real menu-grounded voice ordering (replaces the canned confirm)
+                if (items.contains("Room service request") &&
+                    !items.contains("Emergency / SOS") && !items.contains("Complaint")) {
+                    items.filter { it != "Room service request" && it != "Guest request" }.forEach { other ->
+                        val logLabel = if (other == "Cab booking") other + cabDetailSuffix(said) else other
+                        runCatching { repo.logServiceRequest(deviceCode, logLabel, 1, said, priorityFor(other)) }
+                    }
+                    handleRoomService(
+                        firstUtterance = said, lang = turnLang, deviceCode = deviceCode,
+                        repo = repo, voice = voice, menuCache = menuCache,
+                        setPhase = { vphase = it }, setStatus = { status = it },
+                        addTurn = { role, text -> turns.add(role to text) }
+                    )
+                    delay(MIC_SETTLE_MS)
+                    continue
+                }
                 if (!consumingSpaPref) items.forEach { item ->
                     if (askingSpa && item == "Spa appointment") return@forEach         // hold spa ticket until preference is given
                     val logLabel = if (item == "Cab booking") item + cabDetailSuffix(said) else item
@@ -1045,6 +1064,187 @@ private fun isPositive(t: String): Boolean { val s = t.lowercase()
 private fun isNegative(t: String): Boolean { val s = t.lowercase()
     return Regex("\\b(no|not|bad|poor|terrible|worst|unhappy|dirty|cold|slow|disappointed|rude)\\b").containsMatchIn(s) ||
             s.contains("नहीं") || s.contains("बुरा") || s.contains("ख़राब") || s.contains("खराब") || s.contains("गंदा") || s.contains("देर") || s.contains("ठंडा") || s.contains("नाराज") }
+
+
+// ============ Room service: menu-grounded voice ordering ============
+private const val RS_MAX_ROUNDS = 4
+
+private data class RsLine(val item: MenuItem, val qty: Int)
+
+private fun menuForPrompt(menu: List<MenuItem>): String =
+    menu.joinToString("\n") { "${it.id} | ${it.name} | ₹${"%.0f".format(it.price)}${if (it.isVeg) " (veg)" else ""}" }
+
+private fun rsExtractPrompt(menu: List<MenuItem>): String =
+    "You parse room-service orders for a hotel voice assistant. Return ONLY a JSON object, no markdown, no extra text:\n" +
+            "{\"items\":[{\"id\":\"<menu id>\",\"qty\":<int>}],\"unmatched\":[\"<dish requested that is NOT on the menu>\"],\"suggest\":<true ONLY if the guest named no dish and is asking what's available>}\n" +
+            "Rules: use ONLY ids that appear in the MENU below; never invent ids or dishes. Map Hindi/Hinglish dish names to the closest menu item only when clearly the same dish, else add the words to \"unmatched\". Default qty to 1 when unstated.\n\nMENU:\n" +
+            menuForPrompt(menu)
+
+private fun parseJsonObject(raw: String): JSONObject? {
+    val a = raw.indexOf('{'); val b = raw.lastIndexOf('}')
+    if (a < 0 || b <= a) return null
+    return runCatching { JSONObject(raw.substring(a, b + 1)) }.getOrNull()
+}
+
+private fun buildLines(menu: List<MenuItem>, counts: Map<String, Int>): List<RsLine> =
+    counts.mapNotNull { (id, q) -> menu.firstOrNull { it.id == id }?.let { RsLine(it, q) } }.filter { it.qty > 0 }
+
+private fun rsTotal(lines: List<RsLine>): Double = lines.sumOf { it.item.price * it.qty }
+
+private fun numWord(n: Int, hi: Boolean): String =
+    if (hi) when (n) { 1->"एक";2->"दो";3->"तीन";4->"चार";5->"पाँच";else->n.toString() }
+    else when (n) { 1->"one";2->"two";3->"three";4->"four";5->"five";6->"six";else->n.toString() }
+
+private fun readBack(lines: List<RsLine>, lang: String): String {
+    val hi = lang == "hi-IN"
+    val parts = lines.map { "${numWord(it.qty, hi)} ${it.item.name}" }
+    val joined = joinHuman(parts, if (hi) "और" else "and")
+    val total = "%.0f".format(rsTotal(lines))
+    return if (hi) "जी, यह रहा आपका ऑर्डर — $joined, कुल ₹$total। क्या मैं ऑर्डर कर दूँ?"
+    else "That's $joined — ₹$total in total. Shall I place the order?"
+}
+
+private fun looksLikeAdd(t: String): Boolean {
+    val s = t.lowercase()
+    return s.contains("add") || s.contains("also") || s.contains("one more") || s.contains("make it") ||
+            s.contains("plus") || s.contains("aur ") || s.contains("और") || s.contains("ek aur")
+}
+
+private fun isCancelRs(t: String): Boolean {
+    val s = t.lowercase().trim()
+    val short = s.split(Regex("\\s+")).size <= 3
+    return s.contains("cancel") || s.contains("never mind") || s.contains("nevermind") ||
+            s.contains("forget it") || s.contains("rehne do") || s.contains("रहने दो") ||
+            (short && (s == "no" || s.contains("no thank") || s.contains("nahi") || s.contains("नहीं")))
+}
+
+private fun rsHandoff(hi: Boolean) =
+    if (hi) "मैंने आपका अनुरोध हमारी रूम-सर्विस टीम को भेज दिया है, वे आपके कमरे में पुष्टि के लिए कॉल करेंगे।"
+    else "I've sent your request to our room-service team; they'll call your room to confirm."
+
+/** Menu-grounded voice ordering: read back, confirm, place — or hand off if it can't.
+ *  Never places an order without an explicit "yes"; never invents items/prices; bounded turns. */
+private suspend fun handleRoomService(
+    firstUtterance: String,
+    lang: String,
+    deviceCode: String,
+    repo: HotelRepository,
+    voice: SarvamVoice,
+    menuCache: MutableList<MenuItem>,
+    setPhase: (VoicePhase) -> Unit,
+    setStatus: (String) -> Unit,
+    addTurn: (String, String) -> Unit,
+) {
+    val hi = lang == "hi-IN"
+
+    suspend fun say(text: String) {
+        addTurn("assistant", text)
+        setPhase(VoicePhase.SPEAKING); setStatus("")
+        runCatching { voice.speak(text, lang) }
+        delay(MIC_SETTLE_MS)
+    }
+    suspend fun hear(): String? {
+        setPhase(VoicePhase.LISTENING); setStatus(listeningHint(lang))
+        val wav = voice.listen(maxMs = 13000, silenceMs = 1300, startTimeoutMs = 7000) ?: return null
+        setPhase(VoicePhase.THINKING); setStatus(thinkingHint(lang))
+        val said = runCatching { voice.transcribeAuto(wav) }.getOrNull()?.first?.trim().orEmpty()
+        if (said.isNotBlank()) { addTurn("user", said); return said }
+        return null
+    }
+    suspend fun fileTicket(raw: String) {
+        runCatching { repo.logServiceRequest(deviceCode, "Room service request", 1, raw, "normal") }
+    }
+
+    if (menuCache.isEmpty()) {
+        setPhase(VoicePhase.THINKING); setStatus(thinkingHint(lang))
+        runCatching { repo.listMenu(deviceCode) }.getOrNull()?.let { menuCache.addAll(it) }
+    }
+    if (menuCache.isEmpty()) { fileTicket(firstUtterance); say(rsHandoff(hi)); return }
+
+    val menu = menuCache.toList()
+    val sysPrompt = rsExtractPrompt(menu)
+
+    suspend fun extract(utterance: String): Triple<Map<String, Int>, List<String>, Boolean> {
+        val raw = runCatching { voice.chat(listOf("system" to sysPrompt, "user" to "GUEST SAID: \"$utterance\"")) }
+            .onFailure { Log.e("ButlerRS", "extract failed", it) }.getOrNull().orEmpty()
+        val obj = parseJsonObject(raw) ?: return Triple(emptyMap(), emptyList(), false)
+        val counts = LinkedHashMap<String, Int>()
+        obj.optJSONArray("items")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optString("id").trim(); if (id.isBlank()) continue
+                counts[id] = (counts[id] ?: 0) + o.optInt("qty", 1).coerceIn(1, 20)
+            }
+        }
+        val unmatched = mutableListOf<String>()
+        obj.optJSONArray("unmatched")?.let { for (i in 0 until it.length()) it.optString(i).trim().takeIf { s -> s.isNotBlank() }?.let(unmatched::add) }
+        return Triple(counts, unmatched, obj.optBoolean("suggest", false))
+    }
+
+    fun suggestionLine(): String {
+        val picks = menu.take(4).joinToString(", ") { it.name }
+        return if (hi) "ज़रूर! हमारे यहाँ $picks वगैरह उपलब्ध हैं। आप क्या लेना चाहेंगे?"
+        else "Of course! We have $picks, among others. What would you like?"
+    }
+
+    val counts = LinkedHashMap<String, Int>()
+    var pending: String? = firstUtterance
+    var failures = 0
+    var round = 0
+
+    while (round < RS_MAX_ROUNDS) {
+        round++
+        if (pending != null) {
+            val (newItems, unmatched, suggest) = extract(pending!!)
+            pending = null
+            newItems.forEach { (id, q) -> counts[id] = (counts[id] ?: 0) + q }
+            if (counts.isEmpty()) {
+                say(if (unmatched.isNotEmpty())
+                    (if (hi) "क्षमा कीजिए, ${unmatched.first()} मेन्यू में नहीं है। ${suggestionLine()}"
+                    else "I'm sorry, we don't have ${unmatched.first()}. ${suggestionLine()}")
+                else suggestionLine())
+                val next = hear()
+                if (next == null) { failures++; if (failures >= 2) { fileTicket(firstUtterance); say(rsHandoff(hi)); return }; continue }
+                if (isStopPhrase(next)) { say(if (hi) "ठीक है। और कुछ हो तो बताइए।" else "Alright. Let me know if you need anything else."); return }
+                pending = next
+                continue
+            }
+            if (unmatched.isNotEmpty())
+                say(if (hi) "${unmatched.first()} तो हमारे पास नहीं है, बाकी नोट कर लिया।"
+                else "We don't have ${unmatched.first()}, but I've noted the rest.")
+        }
+
+        val lines = buildLines(menu, counts)
+        if (lines.isEmpty()) {
+            counts.clear(); say(suggestionLine())
+            pending = hear(); if (pending == null) { fileTicket(firstUtterance); say(rsHandoff(hi)); return }; continue
+        }
+
+        say(readBack(lines, lang))
+        when (val ans = hear()) {
+            null -> { failures++; if (failures >= 2) { fileTicket(firstUtterance); say(rsHandoff(hi)); return } }
+            else -> when {
+                isPositive(ans) && !looksLikeAdd(ans) -> {
+                    setPhase(VoicePhase.THINKING); setStatus(thinkingHint(lang))
+                    val placed = runCatching {
+                        repo.placeRoomServiceOrder(deviceCode, lines.map { CartLine(it.item.id, it.item.name, it.item.price, it.qty) })
+                    }.isSuccess
+                    if (placed) say(if (hi) "बढ़िया! आपका ऑर्डर रसोई को भेज दिया गया है — लगभग 30 मिनट में पहुँच जाएगा।"
+                    else "Wonderful! Your order's gone to the kitchen — it'll be about 30 minutes.")
+                    else { fileTicket(firstUtterance); say(rsHandoff(hi)) }
+                    return
+                }
+                isCancelRs(ans) -> {
+                    say(if (hi) "कोई बात नहीं — ऑर्डर रद्द कर दिया। और कुछ चाहिए तो बताइए।"
+                    else "No problem — I've cancelled that. Let me know if there's anything else."); return
+                }
+                else -> pending = ans   // add / modify → re-parse next round
+            }
+        }
+    }
+    fileTicket(firstUtterance)
+    say(rsHandoff(hi))
+}
 
 private fun buildSystemPrompt(stay: StayInfo): String {
     return "You are Butler, the warm, courteous in-room concierge at Jehan Numa Palace, Bhopal. " +
