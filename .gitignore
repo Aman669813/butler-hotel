@@ -16,3 +16,4 @@ local.properties
 .kotlin/
 **/build/
 .idea/
+CLAUDE.md

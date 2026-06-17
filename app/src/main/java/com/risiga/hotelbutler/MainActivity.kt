@@ -196,6 +196,8 @@ private fun VoiceConcierge(
 
     LaunchedEffect(stay.stayId) {
         // 1) Greet on check-in, then fall silent
+        Log.d("BUTLER", "--- CHECK-IN: ${stay.guestName} | room ${stay.roomNumber} | lang $language ---")
+        Log.d("BUTLER", "GREETING: $greeting")
         vphase = VoicePhase.SPEAKING; status = ""
         runCatching { voice.speak(greeting, language) }
         runCatching { voice.prewarm(promptYes(language), language) }   // cache the first wake reply → instant
@@ -207,6 +209,7 @@ private fun VoiceConcierge(
             val ann = runCatching { repo.nextAnnouncement(deviceCode) }.getOrNull()
             if (ann != null && isActive) {
                 announcementLine(ann, language)?.let { line ->
+                    Log.d("BUTLER", "ANNOUNCEMENT [${ann.kind}]: $line")
                     vphase = VoicePhase.SPEAKING; status = ""
                     runCatching { voice.speak(line, language) }
                     delay(MIC_SETTLE_MS)
@@ -218,6 +221,7 @@ private fun VoiceConcierge(
             val done = runCatching { repo.recentCompletedForDevice(deviceCode) }.getOrNull().orEmpty()
             if (done.isNotEmpty() && isActive) {
                 val fb = done.first()
+                Log.d("BUTLER", "FEEDBACK REQUEST for: ${fb.item}")
                 vphase = VoicePhase.SPEAKING; status = ""
                 runCatching { voice.speak(feedbackPrompt(fb.item, language), language) }
                 delay(MIC_SETTLE_MS)
@@ -225,6 +229,7 @@ private fun VoiceConcierge(
                 val fw = voice.listen(maxMs = 9000, silenceMs = 1200, startTimeoutMs = 6000)
                 val ans = if (fw != null) runCatching { voice.transcribe(fw, language) }.getOrNull()?.trim().orEmpty() else ""
                 val rating = when { ans.isBlank() -> 4; isNegative(ans) -> 2; isPositive(ans) -> 5; else -> 4 }
+                Log.d("BUTLER", "FEEDBACK answer: \"$ans\" → rating $rating/5")
                 runCatching { repo.rateRequest(fb.id, rating, ans) }
                 if (rating <= 2) runCatching {
                     repo.logServiceRequest(deviceCode, "Complaint", 1, ans.ifBlank { "Guest dissatisfied with ${fb.item}" }, "urgent")
@@ -241,11 +246,13 @@ private fun VoiceConcierge(
                 val w = voice.listen(maxMs = 4500, silenceMs = 700, startTimeoutMs = 4000)
                 if (w != null) {
                     val heard = runCatching { voice.transcribe(w, "en-IN") }.getOrNull().orEmpty()
-                    if (isWake(heard)) { woke = true; continue }
+                    if (heard.isNotBlank()) Log.d("BUTLER", "IDLE heard: \"$heard\"")
+                    if (isWake(heard)) { Log.d("BUTLER", "WAKE WORD detected"); woke = true; continue }
                 }
                 val idleAnn = runCatching { repo.nextAnnouncement(deviceCode) }.getOrNull()
                 if (idleAnn != null && isActive) {
                     announcementLine(idleAnn, language)?.let { line ->
+                        Log.d("BUTLER", "ANNOUNCEMENT (idle) [${idleAnn.kind}]: $line")
                         vphase = VoicePhase.SPEAKING; status = ""
                         runCatching { voice.speak(line, language) }
                         delay(MIC_SETTLE_MS)
@@ -278,6 +285,7 @@ private fun VoiceConcierge(
 
                 // Emergency — deterministic, never wait on the model.
                 if (isEmergency(said)) {
+                    Log.d("BUTLER", "EMERGENCY detected — filing SOS ticket")
                     runCatching { repo.logServiceRequest(deviceCode, "Emergency / SOS", 1, said, "urgent") }
                     val r = emergencyLine(turnLang)
                     turns.add("assistant" to r); Log.d("CONVERSATION", "ASSISTANT: $r")
@@ -301,10 +309,14 @@ private fun VoiceConcierge(
                     // File a staff ticket if the brain identified one (emergency handled above).
                     result.service?.takeIf { it != "Emergency / SOS" }?.let { svc ->
                         val label = if (svc == "Cab booking") svc + cabDetailSuffix(said) else svc
+                        Log.d("BUTLER", "SERVICE FILED: \"$label\" | priority: ${priorityFor(svc)}")
                         runCatching { repo.logServiceRequest(deviceCode, label, 1, said, priorityFor(svc)) }
                     }
                     // Place a food order ONLY when the guest has confirmed; prices come from the real menu.
                     if (result.placeOrder && result.order.isNotEmpty()) {
+                        val summary = result.order.joinToString { "${it.qty}× ${it.item.name} (₹${"%.0f".format(it.item.price)})" }
+                        val total = result.order.sumOf { it.item.price * it.qty }
+                        Log.d("BUTLER", "ORDER PLACED: $summary | total ₹${"%.0f".format(total)}")
                         runCatching {
                             repo.placeRoomServiceOrder(deviceCode,
                                 result.order.map { CartLine(it.item.id, it.item.name, it.item.price, it.qty) })
@@ -471,6 +483,7 @@ private suspend fun butlerBrain(
     val msgs = listOf("system" to sysPrompt) + history.takeLast(16)
     val raw = runCatching { voice.chat(msgs) }
         .onFailure { Log.e("ButlerBrain", "chat failed", it) }.getOrNull().orEmpty()
+    Log.d("ButlerBrain", "RAW: $raw")
     val obj = parseJsonObject(raw) ?: return null
     val reply = obj.optString("reply").trim()
     val service = obj.optString("service").trim().takeIf { it in SERVICE_LABELS }
