@@ -227,7 +227,8 @@ private fun VoiceConcierge(
                 val rating = when { ans.isBlank() -> 4; isNegative(ans) -> 2; isPositive(ans) -> 5; else -> 4 }
                 runCatching { repo.rateRequest(fb.id, rating, ans) }
                 if (rating <= 2) runCatching {
-                    repo.logServiceRequest(deviceCode, "Complaint", 1, ans.ifBlank { "Guest dissatisfied with ${fb.item}" }, "urgent")
+                    repo.logServiceRequest(deviceCode, Department.FRONT_DESK.tab, "Complaint", 1,
+                        ans.ifBlank { "Guest dissatisfied with ${fb.item}" }, "urgent")
                 }
                 vphase = VoicePhase.SPEAKING
                 runCatching { voice.speak(if (rating <= 2) sorryLine(language) else thanksLine(language), language) }
@@ -278,7 +279,7 @@ private fun VoiceConcierge(
 
                 // Emergency — deterministic, never wait on the model.
                 if (isEmergency(said)) {
-                    runCatching { repo.logServiceRequest(deviceCode, "Emergency / SOS", 1, said, "urgent") }
+                    runCatching { repo.logServiceRequest(deviceCode, Department.FRONT_DESK.tab, "Emergency / SOS", 1, said, "urgent") }
                     val r = emergencyLine(turnLang)
                     turns.add("assistant" to r); Log.d("CONVERSATION", "ASSISTANT: $r")
                     vphase = VoicePhase.SPEAKING; status = ""
@@ -299,9 +300,12 @@ private fun VoiceConcierge(
 
                 val reply = if (result == null) graceful(turnLang) else {
                     // File a staff ticket if the brain identified one (emergency handled above).
-                    result.service?.takeIf { it != "Emergency / SOS" }?.let { svc ->
-                        val label = if (svc == "Cab booking") svc + cabDetailSuffix(said) else svc
-                        runCatching { repo.logServiceRequest(deviceCode, label, 1, said, priorityFor(svc)) }
+                    // Deterministic routing — Routing.kt is the only thing that picks a department.
+                    routeRequest(said, result.service)?.let { r ->
+                        val item = if (r.department == Department.TRANSPORT) r.item + cabDetailSuffix(said) else r.item
+                        runCatching {
+                            repo.logServiceRequest(deviceCode, r.department.tab, item, r.quantity, r.raw, r.priority)
+                        }
                     }
                     // Place a food order ONLY when the guest has confirmed; prices come from the real menu.
                     if (result.placeOrder && result.order.isNotEmpty()) {
@@ -425,12 +429,7 @@ private data class BrainResult(
     val end: Boolean             // true when the guest is done
 )
 
-/** The set of staff tickets the brain may raise. Anything else it returns is ignored. */
-private val SERVICE_LABELS = setOf(
-    "Fresh towels", "Laundry", "Cab booking", "Housekeeping", "Room amenities", "Maintenance",
-    "Spa appointment", "Wake-up call", "Front desk", "Doctor / medical", "Late checkout request",
-    "Complaint", "Lost & found", "Emergency / SOS", "Room service request"
-)
+
 
 /** Pulls the first {...} JSON object out of a model reply and parses it; null on failure. */
 private fun parseJsonObject(raw: String): JSONObject? {
@@ -451,7 +450,8 @@ private fun buildBrainPrompt(stay: StayInfo, menu: List<MenuItem>): String {
         Rules:
         - "reply": 1-2 short, natural sentences, like a gracious concierge. Reply in the SAME language the guest just used (Hindi to natural Hindi, English to English). Never mix scripts. Never ask the guest to repeat or rephrase — give your best answer.
         - Always answer the guest's MOST RECENT message. The topic can change at any time: if they were ordering food and then ask to clean the bathroom, switch immediately — set "service":"Housekeeping" and stop talking about food.
-        - "service": pick the ONE label that matches a staff task, otherwise "none". Allowed labels: Fresh towels, Laundry, Cab booking, Housekeeping, Room amenities, Maintenance, Spa appointment, Wake-up call, Front desk, Doctor / medical, Late checkout request, Complaint, Lost & found, Emergency / SOS, Room service request.
+        - "service": pick the ONE label that matches a real staff task, else "none". Labels: Fresh towels, Laundry, Cab booking, Housekeeping, Room amenities, Maintenance, Spa appointment, Wake-up call, Front desk, Doctor / medical, Late checkout request, Complaint, Lost & found, Room service request. Anything broken or not working (fan, light, AC, TV, geyser, tap, flush) is ALWAYS "Maintenance". A pure question (tourist spots, timings, directions, hotel facts) is NOT a task — answer it and set "service":"none".
+        - NEVER tell the guest which department or desk you are routing to. Do not say "front desk", "housekeeping", "kitchen", etc. Just assure them warmly you've noted it and it'll be taken care of right away.
         - Food: if the MENU below is empty or shows "unavailable", do NOT invent any dish or price — instead set "service":"Room service request" and "order":[], and tell the guest you have noted their food request and the kitchen will follow up to take their order. Only when the MENU lists real items: use ONLY ids from the MENU — never invent dishes or prices. Put chosen items in "order" with quantities. When the guest asks what is available, name 3-5 real items from the MENU. Read the order back (items + total using the MENU prices) and ask them to confirm. Set "place_order":true ONLY on the turn the guest confirms (yes / place it / go ahead), and on that turn include the full order in "order". Otherwise "place_order":false and "order":[]. If they ask for something not on the MENU, say it is unavailable and suggest a close item.
         - Questions about the hotel or Bhopal: answer concretely from the facts below; never invent prices or room details — offer the front desk if unsure.
         - "end": true only when the guest says goodbye or that they need nothing more.
@@ -522,12 +522,7 @@ private fun cabDetailSuffix(t: String): String {
     return if (dest != null) " — $dest" else ""
 }
 
-/** Urgent for complaints/lost items/emergency; high for late checkout; normal otherwise. */
-private fun priorityFor(label: String): String = when (label) {
-    "Emergency / SOS", "Complaint", "Lost & found" -> "urgent"
-    "Late checkout request" -> "high"
-    else -> "normal"
-}
+
 
 // ---------------- Proactive spoken updates ----------------
 private fun announcementLine(a: Announcement, lang: String): String? {

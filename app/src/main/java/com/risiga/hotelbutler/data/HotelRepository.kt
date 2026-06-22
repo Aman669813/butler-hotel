@@ -38,10 +38,17 @@ class HotelRepository {
             .firstOrNull()
 
     // ---- Service requests (device -> reception + staff board) ----------
-    suspend fun logServiceRequest(deviceCode: String, item: String, quantity: Int = 1,
-                                  raw: String? = null, priority: String = "normal") {
+    suspend fun logServiceRequest(
+        deviceCode: String,
+        department: String,
+        item: String,
+        quantity: Int = 1,
+        raw: String? = null,
+        priority: String = "normal"
+    ) {
         val params: JsonObject = buildJsonObject {
             put("p_device_code", deviceCode)
+            put("p_department", department)
             put("p_item", item)
             put("p_quantity", quantity)
             put("p_raw", raw ?: item)
