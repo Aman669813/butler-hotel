@@ -298,23 +298,38 @@ private fun VoiceConcierge(
                 val brainPrompt = buildBrainPrompt(stay, menuCache.toList())
                 val result = butlerBrain(brainPrompt, turns.toList(), menuCache.toList(), voice)
 
-                val reply = if (result == null) graceful(turnLang) else {
-                    // File a staff ticket if the brain identified one (emergency handled above).
-                    // Deterministic routing — Routing.kt is the only thing that picks a department.
-                    routeRequest(said, result.service)?.let { r ->
-                        val item = if (r.department == Department.TRANSPORT) r.item + cabDetailSuffix(said) else r.item
-                        runCatching {
-                            repo.logServiceRequest(deviceCode, r.department.tab, item, r.quantity, r.raw, r.priority)
-                        }
+                // 1) Non-food services (towels, AC, cab, spa, housekeeping…) — fully deterministic.
+                val routed = routeRequest(said, result?.service)
+                routed?.let { r ->
+                    val item = if (r.department == Department.TRANSPORT) r.item + cabDetailSuffix(said) else r.item
+                    runCatching { repo.logServiceRequest(deviceCode, r.department.tab, item, r.quantity, r.raw, r.priority) }
+                }
+
+                // 2) Food. Did the brain understand it as a menu order (items to read back / confirm)?
+                val brainHandledFood = result != null && (result.order.isNotEmpty() || result.placeOrder)
+                // Place the structured order only once the guest has confirmed it.
+                if (result?.placeOrder == true && result.order.isNotEmpty()) {
+                    runCatching {
+                        repo.placeRoomServiceOrder(deviceCode,
+                            result.order.map { CartLine(it.item.id, it.item.name, it.item.price, it.qty) })
                     }
-                    // Place a food order ONLY when the guest has confirmed; prices come from the real menu.
-                    if (result.placeOrder && result.order.isNotEmpty()) {
-                        runCatching {
-                            repo.placeRoomServiceOrder(deviceCode,
-                                result.order.map { CartLine(it.item.id, it.item.name, it.item.price, it.qty) })
-                        }
-                    }
-                    result.reply.ifBlank { graceful(turnLang) }
+                }
+                // Fallback: a clear food request the brain DIDN'T handle (call failed / menu empty)
+                // must still reach the kitchen — never get swallowed by a generic reply.
+                val foodTicket = routed == null && !brainHandledFood && isFoodRequest(said) &&
+                        (result == null || result.reply.isBlank())
+                if (foodTicket) {
+                    runCatching { repo.logServiceRequest(deviceCode, Department.KITCHEN.tab, "Room service request", 1, said, "normal") }
+                }
+
+                // 3) What Butler says — always matches where the request actually went.
+                val reply = when {
+                    routed != null -> confirmLine(routed, turnLang)
+                    foodTicket -> if (turnLang == "hi-IN")
+                        "ज़रूर — मैंने आपका ऑर्डर रसोई को भेज दिया है; वे जल्द ही आपके कमरे में पहुँचाएँगे।"
+                    else "Certainly — I've sent your order to our kitchen; they'll have it up to your room shortly."
+                    result != null && result.reply.isNotBlank() -> result.reply
+                    else -> graceful(turnLang)
                 }
 
                 turns.add("assistant" to reply)
@@ -497,13 +512,58 @@ private fun isEmergency(t: String): Boolean {
     ).any { s.contains(it) }
 }
 
+
+/** A clear food / room-service request (used only as a fallback when the brain doesn't handle it). */
+private fun isFoodRequest(t: String): Boolean {
+    val s = t.lowercase()
+    return listOf(
+        "roti","chapati","naan","paratha","paneer","biryani","dosa","idli","rice","chawal","dal",
+        "curry","sabzi","sandwich","pizza","burger","noodles","soup","thali","tikka","kebab",
+        "order food","bring food","get me food","want food","need food","room service","hungry",
+        "रोटी","चपाती","नान","पनीर","बिरयानी","दोसा","चावल","दाल","सब्ज़ी","थाली","खाना","भूख","ऑर्डर"
+    ).any { s.contains(it) }
+}
+
 private fun emergencyLine(lang: String) = if (lang == "hi-IN")
     "मैं तुरंत हमारी टीम को सूचित कर रहा हूँ — मदद आ रही है। कृपया शांत रहें और वहीं रहें।"
 else "I'm alerting our team right now — help is on the way. Please stay calm and remain where you are."
 
 private fun graceful(lang: String) = if (lang == "hi-IN")
-    "ज़रूर, मैं अभी हमारी फ्रंट डेस्क से आपकी सहायता करवाता हूँ।"
-else "Certainly — I'll have our front desk help you with that right away."
+    "ज़रूर — मैंने इसका ध्यान रखने के लिए कह दिया है, यह अभी कर दिया जाएगा।"
+else "Of course — I've noted that, and it'll be taken care of right away."
+
+/** Warm, correct confirmation for a routed request — never names the wrong desk. */
+private fun confirmLine(r: Routed, lang: String): String {
+    val hi = lang == "hi-IN"
+    return when (r.department) {
+        Department.HOUSEKEEPING -> when {
+            r.item.contains("towel", true) ->
+                if (hi) "ज़रूर — ताज़े तौलिये अभी आपके कमरे में भिजवा रहा हूँ।"
+                else "Of course — fresh towels are on their way to your room right away."
+            r.item.contains("laundry", true) ->
+                if (hi) "ज़रूर — आपकी लॉन्ड्री का ध्यान रखा जा रहा है।"
+                else "Of course — your laundry is being taken care of."
+            else ->
+                if (hi) "ज़रूर — हाउसकीपिंग को बता दिया है, वे जल्दी आपके पास पहुँचेंगे।"
+                else "Of course — I've let housekeeping know; they'll be with you shortly."
+        }
+        Department.MAINTENANCE ->
+            if (hi) "माफ़ कीजिए — मैंने मेंटेनेंस टीम को प्राथमिकता पर सूचित कर दिया है।"
+            else "I'm sorry about that — I've alerted our maintenance team on priority."
+        Department.SPA ->
+            if (hi) "खुशी से — हमारा स्पा डेस्क जल्द ही आपका समय पक्का करेगा।"
+            else "With pleasure — our spa desk will confirm your appointment shortly."
+        Department.TRANSPORT ->
+            if (hi) "हो गया — हम आपकी कैब की व्यवस्था कर रहे हैं और समय बता देंगे।"
+            else "Arranged — we're booking your cab and will confirm the pickup time."
+        Department.KITCHEN ->
+            if (hi) "ज़रूर — मैंने आपका अनुरोध रसोई को भेज दिया है।"
+            else "Certainly — I've sent your request to our kitchen."
+        Department.FRONT_DESK ->
+            if (hi) "ज़रूर — मैंने इसका ध्यान रखने के लिए कह दिया है, यह अभी कर दिया जाएगा।"
+            else "Certainly — I've noted that, and it'll be taken care of right away."
+    }
+}
 
 /** Pick the TTS voice from the text itself, so a switch in language is spoken correctly. */
 private fun ttsLangOf(text: String): String =

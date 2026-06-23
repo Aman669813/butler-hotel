@@ -39,22 +39,28 @@ class HotelRepository {
 
     // ---- Service requests (device -> reception + staff board) ----------
     suspend fun logServiceRequest(
-        deviceCode: String,
-        department: String,
-        item: String,
-        quantity: Int = 1,
-        raw: String? = null,
-        priority: String = "normal"
+        deviceCode: String, department: String, item: String,
+        quantity: Int = 1, raw: String? = null, priority: String = "normal"
     ) {
-        val params: JsonObject = buildJsonObject {
-            put("p_device_code", deviceCode)
-            put("p_department", department)
-            put("p_item", item)
-            put("p_quantity", quantity)
-            put("p_raw", raw ?: item)
-            put("p_priority", priority)
+        try {
+            sb.postgrest.rpc("log_service_request", buildJsonObject {
+                put("p_device_code", deviceCode); put("p_department", department)
+                put("p_item", item); put("p_quantity", quantity)
+                put("p_raw", raw ?: item); put("p_priority", priority)
+            })
+            android.util.Log.d("SR", "filed OK (with dept): $item / $department / qty=$quantity")
+        } catch (e: Exception) {
+            android.util.Log.w("SR", "with-dept failed: ${e.message} — retrying without department")
+            try {
+                sb.postgrest.rpc("log_service_request", buildJsonObject {
+                    put("p_device_code", deviceCode); put("p_item", item)
+                    put("p_quantity", quantity); put("p_raw", raw ?: item); put("p_priority", priority)
+                })
+                android.util.Log.d("SR", "filed OK (no dept): $item / qty=$quantity")
+            } catch (e2: Exception) {
+                android.util.Log.e("SR", "INSERT FAILED for $item: ${e2.message}", e2)
+            }
         }
-        sb.postgrest.rpc("log_service_request", params)
     }
 
     /** A recently completed, unrated request for this room (for voice feedback). */
