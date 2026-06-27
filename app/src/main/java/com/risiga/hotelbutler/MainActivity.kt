@@ -1,4 +1,4 @@
-package com.risiga.hotelbutler
+﻿package com.risiga.hotelbutler
 
 import android.Manifest
 import android.os.Bundle
@@ -6,12 +6,11 @@ import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
+import android.webkit.PermissionRequest
+import android.webkit.WebChromeClient
+import android.webkit.WebView
 import androidx.compose.foundation.background
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -336,32 +335,50 @@ private fun VoiceConcierge(
         }
     }
 
-    // ---- UI: ambient, no controls ----
-    val orbColor = when (vphase) {
-        VoicePhase.LISTENING -> ACCENT
-        VoicePhase.THINKING  -> GOLD
-        VoicePhase.SPEAKING  -> PRIMARY
-        else                 -> Color(0xFF6B7A90)
-    }
-    val anim = rememberInfiniteTransition(label = "orb")
-    val pulse by anim.animateFloat(
-        initialValue = 0.92f, targetValue = 1.12f,
-        animationSpec = infiniteRepeatable(tween(1100), RepeatMode.Reverse), label = "pulse")
-    val live = vphase == VoicePhase.LISTENING || vphase == VoicePhase.SPEAKING || vphase == VoicePhase.THINKING
-    val scale = if (live) pulse else 1f
-
-    val lastUser = turns.lastOrNull { it.first == "user" }?.second
+    // ---- UI: WebView orb + conversation overlay ----
+    val lastUser   = turns.lastOrNull { it.first == "user"      }?.second
     val lastButler = turns.lastOrNull { it.first == "assistant" }?.second
 
-    Box(
-        Modifier.fillMaxSize()
-            .background(Brush.verticalGradient(listOf(Color(0xFF0B2545), Color(0xFF12325E))))
-    ) {
+    val webViewRef = remember { mutableStateOf<WebView?>(null) }
+
+    LaunchedEffect(vphase) {
+        val state = when (vphase) {
+            VoicePhase.LISTENING -> "listening"
+            VoicePhase.THINKING  -> "thinking"
+            VoicePhase.SPEAKING  -> "speaking"
+            VoicePhase.GREETING  -> "speaking"
+            VoicePhase.IDLE      -> "idle"
+        }
+        webViewRef.value?.post {
+            webViewRef.value?.evaluateJavascript("setOrbState('$state')", null)
+        }
+    }
+
+    Box(Modifier.fillMaxSize()) {
+
+        AndroidView(
+            factory = { ctx ->
+                WebView(ctx).apply {
+                    settings.javaScriptEnabled = true
+                    settings.mediaPlaybackRequiresUserGesture = false
+                    setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                    webChromeClient = object : WebChromeClient() {
+                        override fun onPermissionRequest(request: PermissionRequest) {
+                            request.grant(request.resources)
+                        }
+                    }
+                    loadUrl("file:///android_asset/butler_orb.html")
+                    webViewRef.value = this
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
         Row(
             Modifier.fillMaxWidth().padding(start = 24.dp, end = 24.dp, top = 30.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("\uD83D\uDECE\uFE0F  JEHAN NUMA · BUTLER", color = Color(0xFFBFD2F5),
+            Text("🛎️  JEHAN NUMA · BUTLER", color = Color(0xFFBFD2F5),
                 fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
             Spacer(Modifier.weight(1f))
             Box(Modifier.clip(RoundedCornerShape(20.dp)).background(Color(0x33FFFFFF))
@@ -371,37 +388,25 @@ private fun VoiceConcierge(
         }
 
         Column(
-            Modifier.fillMaxSize().padding(horizontal = 30.dp),
-            verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally
+            Modifier
+                .fillMaxWidth()
+                .align(Alignment.BottomCenter)
+                .padding(horizontal = 30.dp, vertical = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Box(
-                Modifier.size((150 * scale).dp).clip(RoundedCornerShape(percent = 50))
-                    .background(Brush.radialGradient(listOf(orbColor.copy(alpha = .95f), orbColor.copy(alpha = .35f)))),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    when (vphase) {
-                        VoicePhase.LISTENING -> "\uD83C\uDFA4"
-                        VoicePhase.THINKING  -> "\u2026"
-                        VoicePhase.SPEAKING  -> "\uD83D\uDD0A"
-                        else                 -> "\uD83D\uDECE\uFE0F"
-                    }, fontSize = 46.sp
-                )
-            }
-            Spacer(Modifier.height(30.dp))
             Text(
-                if (vphase == VoicePhase.IDLE) wakeHint(language) else status.ifEmpty { "…" },
+                if (vphase == VoicePhase.IDLE) wakeHint(language) else status.ifEmpty { "..." },
                 color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center
             )
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(6.dp))
             Text(
                 if (vphase == VoicePhase.IDLE) "I'm here whenever you need me, $firstName."
-                else "Speak naturally — I'll take care of it.",
+                else "Speak naturally I'll take care of it.",
                 color = Color(0xFF9FB3D1), fontSize = 13.sp, textAlign = TextAlign.Center
             )
 
             if (lastUser != null) {
-                Spacer(Modifier.height(34.dp))
+                Spacer(Modifier.height(20.dp))
                 Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp))
                     .background(Color(0x1AFFFFFF)).padding(16.dp)) {
                     Column {
@@ -415,13 +420,16 @@ private fun VoiceConcierge(
                     }
                 }
             }
-        }
 
-        if (onBack != null) {
-            OutlinedButton(onClick = onBack, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 22.dp)) {
-                Text("← Back to rooms", color = Color(0xFFBFD2F5))
+            if (onBack != null) {
+                Spacer(Modifier.height(16.dp))
+                OutlinedButton(onClick = onBack) {
+                    Text("← Back to rooms", color = Color(0xFFBFD2F5))
+                }
             }
         }
+    }
+}
     }
 }
 
