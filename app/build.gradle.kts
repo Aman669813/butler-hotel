@@ -11,6 +11,11 @@ plugins {
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
 }
+val localProps = java.util.Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.exists()) load(f.inputStream())
+}
+
 android {
     namespace = "com.risiga.hotelbutler"
     compileSdk = 35
@@ -23,8 +28,8 @@ android {
         buildConfigField("String", "DEVICE_CODE", "\"ROOM-301\"")
         buildConfigField("String", "SUPABASE_URL", "\"https://boioqssdrthhdlpztuis.supabase.co\"")
         buildConfigField("String", "SUPABASE_ANON", "\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJvaW9xc3NkcnRoaGRscHp0dWlzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1NDkyMDksImV4cCI6MjA5NjEyNTIwOX0.c9V5hwI1GhWMaKDS-VKAH-GUxZR2RzTYNbkvHyv7EZE\"")
-        buildConfigField("String", "SARVAM_API_KEY", "\"\"")
-        buildConfigField("String", "OPENAI_API_KEY", "\"\"")
+        buildConfigField("String", "SARVAM_API_KEY", "\"${localProps[\"SARVAM_API_KEY\"] ?: \"\"}\"")
+        buildConfigField("String", "OPENAI_API_KEY", "\"${localProps[\"OPENAI_API_KEY\"] ?: \"\"}\"")
         buildConfigField("Boolean", "DEMO_MODE", "true")
     }
     buildFeatures {
